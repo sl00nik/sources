@@ -1,0 +1,201 @@
+name: Auto-Update Sources Page
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  deployments: write
+  actions: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+env:
+  TARGET_REPOS: "ncurses busybox dropbear dvtm abduco vis"
+  TARGET_OWNER: "sl00nik"
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Generate Static HTML Site
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p public
+
+          write_header() {
+            cat << 'EOF' > public/index.html
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>Sources</title>
+              <style>
+                  :root { --bg: #f8fafc; --card: #ffffff; --text: #0f172a; --accent: #4f46e5; }
+                  body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; padding: 2rem; max-width: 900px; margin: 0 auto; }
+                  footer { margin-top: 3rem; font-size: 0.875rem; color: #94a3b8; text-align: center; }
+                  .release-list { display: grid; gap: 1rem; }
+                  .release-item { background: var(--card); padding: 1.5rem; border-radius: 8px; display: flex; flex-direction: column; gap: 0.5rem; }
+                  .release-header { font-size: 1.25rem; font-weight: 600; text-transform: capitalize; }
+                  .info-row { display: flex; align-items: baseline; gap: 0.5rem; }
+                  .label { font-size: 0.875rem; color: #64748b; font-weight: 500; min-width: 90px;}
+                  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; background: #f1f5f9; padding: 0.125rem 0.375rem; border-radius: 4px; font-size: 0.875rem; word-break: break-all; }
+                  a { color: var(--accent); text-decoration: none; }
+                  a:hover { text-decoration: underline; }
+                  .btn-download { display: inline-flex; align-items: center; justify-content: center; background: var(--accent); color: white; padding: 0.5rem 1rem; border-radius: 6px; font-weight: 500; margin-top: 0.5rem; width: fit-content; transition: background 0.2s; }
+                  .btn-download:hover { background: #4338ca; text-decoration: none; }
+              </style>
+          </head>
+          <body>
+              <div class="release-list">
+          EOF
+          }
+
+          write_footer() {
+            local build_date
+            build_date=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+            
+            cat << EOF >> public/index.html
+              </div>
+              <footer>
+                  <p>Auto-generated via GitHub Actions</p>
+                  <p>Last updated: $build_date</p>
+              </footer>
+          </body>
+          </html>
+          EOF
+          }
+
+          process_repo() {
+            local repo="$1"
+            echo "Processing $repo..."
+
+            local parent_repo
+            parent_repo=$(gh api "/repos/$TARGET_OWNER/$repo" --jq '.parent.full_name // empty' 2>/dev/null || true)
+            if [ -z "$parent_repo" ]; then
+              parent_repo="$TARGET_OWNER/$repo"
+            fi
+
+            local commitish
+            commitish=$(gh api "/repos/$TARGET_OWNER/$repo/releases/tags/latest" --jq '.target_commitish // empty' 2>/dev/null || true)
+
+            local commit_sha="$commitish"
+            if [ -n "$commitish" ] && [ ${#commitish} -lt 40 ]; then
+                commit_sha=$(gh api "/repos/$TARGET_OWNER/$repo/commits/$commitish" --jq '.sha' 2>/dev/null || true)
+            fi
+
+            local short_sha="unknown"
+            if [ -z "$commit_sha" ] || [ "$commit_sha" = "null" ]; then
+                commit_sha="unknown"
+            else
+                short_sha="${commit_sha:0:7}"
+            fi
+
+            local dl_url="https://github.com/$TARGET_OWNER/$repo/releases/download/latest/source.tar.gz"
+            local hash="not_found_or_unavailable"
+
+            if gh release download latest -R "$TARGET_OWNER/$repo" -p "source.tar.gz.sha256" --output temp.sha256 2>/dev/null; then
+                if [ -s temp.sha256 ]; then
+                    hash=$(awk '{print $1}' temp.sha256)
+                fi
+                rm -f temp.sha256
+            elif gh release download latest -R "$TARGET_OWNER/$repo" -p "source.tar.gz" --output temp.tar.gz 2>/dev/null; then
+                if [ -s temp.tar.gz ]; then
+                    hash=$(sha256sum temp.tar.gz | awk '{print $1}')
+                fi
+                rm -f temp.tar.gz
+            else
+                echo "Warning: Failed to fetch hash or archive for $repo"
+            fi
+
+            cat << EOF >> public/index.html
+                  <div class="release-item">
+                      <div class="release-header">$repo</div>
+                      <div class="info-row">
+                          <span class="label">Commit:</span>
+                          <a href="https://github.com/$parent_repo/commit/$commit_sha" rel="noopener noreferrer" target="_blank" class="mono">$short_sha</a>
+                      </div>
+                      <div class="info-row">
+                          <span class="label">SHA256:</span>
+                          <span class="mono">$hash</span>
+                      </div>
+                      <a href="$dl_url" class="btn-download">Download</a>
+                  </div>
+          EOF
+          }
+
+          write_header
+
+          for repo in $TARGET_REPOS; do
+            process_repo "$repo"
+          done
+
+          write_footer
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public/
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Cleanup Old Deployments and Workflow Runs
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          echo "=== Phase 1: Cleaning up old workflow runs ==="
+          WORKFLOW_REF="${{ github.workflow_ref }}"
+          WORKFLOW_FILENAME=$(basename "${WORKFLOW_REF%@*}")
+
+          RUN_IDS=$(gh api --paginate "/repos/${{ github.repository }}/actions/workflows/$WORKFLOW_FILENAME/runs?per_page=100" \
+            --jq ".workflow_runs[] | select(.id != ${{ github.run_id }}) | .id" 2>/dev/null || true)
+
+          if [ -n "$RUN_IDS" ]; then
+            for ID in $RUN_IDS; do
+              echo "Deleting workflow run: $ID"
+              gh api -X DELETE "/repos/${{ github.repository }}/actions/runs/$ID" >/dev/null || true
+            done
+          else
+            echo "No old workflow runs found."
+          fi
+
+          echo "=== Phase 2: Cleaning up old GitHub Pages deployments ==="
+          DEPLOYMENTS=$(gh api "/repos/${{ github.repository }}/deployments?environment=github-pages&per_page=100" \
+            --jq '.[].id' 2>/dev/null || true)
+
+          if [ -n "$DEPLOYMENTS" ]; then
+            COUNT=0
+            for ID in $DEPLOYMENTS; do
+              COUNT=$((COUNT+1))
+              if [ "$COUNT" -eq 1 ]; then
+                echo "Keeping latest active deployment ID: $ID"
+                continue
+              fi
+
+              echo "Cleaning up old deployment ID: $ID"
+              gh api -X POST "/repos/${{ github.repository }}/deployments/$ID/statuses" \
+                -f state=inactive >/dev/null || true
+              gh api -X DELETE "/repos/${{ github.repository }}/deployments/$ID" >/dev/null || true
+            done
+          else
+            echo "No deployments found."
+          fi
